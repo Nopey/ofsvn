@@ -13,14 +13,19 @@ use lazy_static::*;
 use std::process::Command;
 
 const DEV_ROLE: RoleId = RoleId(545127775900532741);
+const SVN_HOST_ROLE: RoleId = RoleId(635605034922410004);
 const DEV_GUILD: GuildId = GuildId(544949171162185769);
 
-const APACHE_PASSWD_FILE: &'static str = "/tmp/passwd.txt";
-const AUDITLOG_FILE: &'static str = "auditlog.txt";
-const BCRYPT_DIFFICULTY: &'static str = "8"; // 6 is default. 5-15 valid.
+const FORBIDDEN_NAMES: [&'static str; 3] = ["autonopey", "ofs", "ofs-developer"];
+
+const APACHE_PASSWD_FILE: &'static str = "/etc/subversion/passwd";
+const APACHE_HTPASSWD: &'static str = "htpasswd";
+const AUDITLOG_FILE: &'static str = "/etc/subversion/auditlog.txt";
+const OFSVN_JSON: &'static str = "/etc/subversion/ofsvn.json";
+const BCRYPT_DIFFICULTY: &'static str = "9"; // 6 is default. 5-15 valid.
 
 const HELP_STRING: &'static str = "help:
-!username to set your SVN username. (do this first)
+!username to set your SVN username. (do this first. this shows up in #svn-commits)
 !password password to set your SVN password. Password must be *adequite*.
 !clear to clear your credentials";
 
@@ -37,25 +42,25 @@ struct Store {
 
 impl Store{
     fn set_apache_password(name: &str, password: &str){
-        println!("set apache password {:?}", Command::new("htpasswd")
+        println!("set apache password {:?}", Command::new(APACHE_HTPASSWD)
         //            UwU
             .args(&["-BbC", BCRYPT_DIFFICULTY, APACHE_PASSWD_FILE, name, password])
             .output().unwrap());
     }
     fn delete_apache_user(name: &str){
-        Command::new("htpasswd")
+        Command::new(APACHE_HTPASSWD)
             .args(&["-D", APACHE_PASSWD_FILE, name])
             .output().unwrap();
     }
     fn load() -> Self {
-        File::open("ofsvn.json")
+        File::open(OFSVN_JSON)
             .map_err(|_| ())
             .and_then(|file| serde_json::from_reader(file).map_err(|_| ()))
             .unwrap_or_else(|_| Store{creds: HashMap::new()})
     }
 
     fn save(&self){
-        let temp = File::create("ofsvn.json").expect("couldn't open ofsvn.json");
+        let temp = File::create(OFSVN_JSON).expect("couldn't open ofsvn.json");
         serde_json::to_writer(temp, self).expect("couldn't save store!");
     }
 
@@ -85,6 +90,10 @@ impl Store{
             user,
             self.creds.get(&user).unwrap().username
         ).unwrap();
+        let username = &self.creds.get(&user).unwrap().username;
+        if username != "" {
+            Self::delete_apache_user(username);
+        }
         *self.creds.get_mut(&user).unwrap() = UserCred::new();
         self.save();
     }
@@ -100,6 +109,10 @@ impl Store{
     }
 
     fn remove_user(&mut self, user: UserId) {
+        let username = &self.creds.get(&user).unwrap().username;
+        if username != "" {
+            Self::delete_apache_user(username);
+        }
         self.creds.remove(&user);
         //TODO: Maybe delay this
         self.save();
@@ -124,11 +137,11 @@ struct Handler{
 }
 
 impl Handler{
-    fn investigate(&self, _ctx: &Context, member: &Member) -> bool {
+    fn investigate(&self, ctx: &Context, member: &Member) -> bool {
         // no bots allowed
         if member.user.read().bot { return false };
         // check if they are allowed to write to the svn
-        let access = member.roles.iter().any(|role| role.0==DEV_ROLE.0);
+        let access = member.roles.iter().any(|role| role.0==DEV_ROLE.0 || role.0==SVN_HOST_ROLE.0);
         // get previous status
         let had_access = self.store.read().creds.contains_key(&member.user_id());
         // user.create_dm_channel for sending creds
@@ -137,10 +150,10 @@ impl Handler{
             (true, false) => {
                 self.store.write().add_user(member.user_id());
                 //TODO: re-enable welcome message
-                // let msg = format!("You've gained access to SVN.\n{}", HELP_STRING);
-                //if let Err(why) = member.user.read().create_dm_channel(&ctx.http).map(|dm| dm.say(&ctx.http, &msg)) {
-                //    println!("Error sending message: {:?}", why);
-                //}
+                let msg = format!("You've gained access to SVN.\n{}", HELP_STRING);
+                if let Err(why) = member.user.read().create_dm_channel(&ctx.http).map(|dm| dm.say(&ctx.http, &msg)) {
+                    println!("Error sending message: {:?}", why);
+                }
                 println!("welcome message sent to {:?}", member.user.read().name);
             },
             // lost access
@@ -149,9 +162,9 @@ impl Handler{
                 self.store.write().remove_user(member.user_id());
                 let msg = format!("You've lost access to SVN.");
                 println!("{} sent to {:?}", msg, member.user.read().name);
-                //if let Err(why) = member.user.read().create_dm_channel(&ctx.http).map(|dm| dm.say(&ctx.http, &msg)) {
-                //    println!("Error sending message: {:?}", why);
-                //}
+                if let Err(why) = member.user.read().create_dm_channel(&ctx.http).map(|dm| dm.say(&ctx.http, &msg)) {
+                    println!("Error sending message: {:?}", why);
+                }
             },
             (_, _) => ()
         }
@@ -224,7 +237,11 @@ impl EventHandler for Handler {
                             println!("Error sending message: {:?}", why);
                         }
                     }else{
-                        if username.len() < 5 || !username.chars().all(|c| c.is_alphanumeric() || c=='-') || self.store.read().creds.iter().any(|kv| kv.1.username==username) {
+                        if username.len() < 5
+                        || !username.chars().all(|c| c.is_alphanumeric() || c=='-')
+                        || self.store.read().creds.iter().any(|kv| kv.1.username==username)
+                        || FORBIDDEN_NAMES.iter().any(|&forb| forb==username)
+                        {
                             if let Err(why) = msg.channel_id.say(&ctx.http, "Bad username. Alphanumeric and dashes only, must be unique, must be at least 5 chars.") {
                                 println!("Error sending message: {:?}", why);
                             }
